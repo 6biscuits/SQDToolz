@@ -2246,7 +2246,7 @@ class ResonatorTempSweep:
         pass
 
     # TLS fit - temperature dependence of Qi
-    @static_method
+    @staticmethod
     def TLS_fit_crowley_temp(
         Qi, T, n_ph, f, bounds=None, Qerr=None, print_log=False, print_fit=True, T_lims=None
     ):
