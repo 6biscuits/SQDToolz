@@ -367,7 +367,7 @@ class ResonatorPowerSweep:
 
     # do circlefit
     def do_circlefit(
-        self, expected_qi_lims=(1e3, 1e8), remove_duplicates=True, n_ph_lims=None, save_fit=True, circuit_type="notch_port"
+        self, expected_qi_lims=(1e3, 1e8), expected_fr_lims=(1e9, 12e9), remove_duplicates=True, n_ph_lims=None, save_fit=True, circuit_type="notch_port"
     ):
         """
         Does circlefits on measurement runs contained in self.data['rawdata'].
@@ -416,7 +416,9 @@ class ResonatorPowerSweep:
         assert (isinstance(expected_qi_lims, (list, tuple))) and (
             len(expected_qi_lims) == 2
         ), "expected_qi_lims should be a list or tuple of length two (min, max)."
-
+        assert (isinstance(expected_fr_lims, (list, tuple))) and (
+            len(expected_fr_lims) == 2
+        ), "expected_fr_lims should be a list or tuple of length two (min, max)."
         assert self.data, "Run import_data() first - there's no data yet!"
 
         fits_completed = 0
@@ -449,7 +451,11 @@ class ResonatorPowerSweep:
                     expected_qi_lims[0]
                     < port.fitresults["Qi_dia_corr"]
                     < expected_qi_lims[1]
-                ):
+                ) and (
+                    expected_fr_lims[0] 
+                    < port.fitresults["fr"] 
+                    < expected_fr_lims[1]
+                    ):
                     fit_keys = port.fitresults.keys()
                     self.data[measurement_name]["fit"] = {}
                     # add fit results to self.data
@@ -1294,9 +1300,11 @@ class ResonatorPowerSweep:
                 x_axis_type="log",
                 y_axis_type="log",
                 y_axis_label=r"$$Q_c$$",
-                x_axis_label=r"Photon number  ⟨n⟩",
+                x_axis_label=r"Photon number ⟨n⟩",
             )
             self._colourmap = Viridis256
+            if self.n_ph_lims != None:
+                self.fig_bokeh.x_range = Range1d(self.n_ph_lims[0], self.n_ph_lims[1])
             if ylims != None:
                 self.fig_bokeh.y_range = Range1d(ylims[0], ylims[1])
         # matplotlib setup
@@ -1308,7 +1316,7 @@ class ResonatorPowerSweep:
             ]
             self.ax_ph_mpl.legend(loc="best")
             self.ax_ph_mpl.set_title(f"{self.name}: " + r"$Q_c$")
-            self.ax_ph_mpl.set_xlabel(r"Photon number $\langle n \rangle$")
+            self.ax_ph_mpl.set_xlabel(r"Photon number ⟨n⟩")
             self.ax_ph_mpl.set_ylabel(r"$Q_c$")
             self.ax_ph_mpl.set_xscale("log")
             self.ax_ph_mpl.set_yscale("log")
@@ -1330,6 +1338,11 @@ class ResonatorPowerSweep:
                             Qc_upper.append(row["absQc"] + row["absQc_err"])
                             Qc_lower.append(row["absQc"] - row["absQc_err"])
                             Qc_err.append(row["absQc_err"])
+
+                # check if Qc is empty
+                if not n_ph or not Qc:
+                    print(f"No data found for {freq_bin_cur}. Skipping this resonator.")
+                    continue    
 
                 # convert to ColumnDataSource for Bokeh plotting
                 if with_errorbars == True:
@@ -1995,10 +2008,21 @@ class ResonatorPowerSweep:
 
                     # sort lists by n_ph
                     sorted_data = sorted(zip(n_ph, Qi, Qi_upper, Qi_lower, Qerr), key=lambda x: x[0])
-                    n_ph, Qi, Qi_upper, Qi_lower, Qerr = map(np.array, zip(*sorted_data)) if sorted_data else ([], [], [], [], [])
+                    if sorted_data:
+                        n_ph, Qi, Qi_upper, Qi_lower, Qerr = map(np.array, zip(*sorted_data))
 
-                    # filter n_ph and Qi
-                    if n_ph_lims is not None:
+                        # Filter out non-finite values
+                        finite_mask = np.isfinite(n_ph) & np.isfinite(Qi) & np.isfinite(Qi_upper) & np.isfinite(Qi_lower) & np.isfinite(Qerr)
+                        n_ph = n_ph[finite_mask]
+                        Qi = Qi[finite_mask]
+                        Qi_upper = Qi_upper[finite_mask]
+                        Qi_lower = Qi_lower[finite_mask]
+                        Qerr = Qerr[finite_mask]
+                    else:
+                        n_ph, Qi, Qi_upper, Qi_lower, Qerr = [], [], [], [], []
+
+                    # filter n_ph and Qi within limits
+                    if n_ph_lims is not None and len(n_ph) > 0:
                         mask = (n_ph > n_ph_lims[0]) & (n_ph < n_ph_lims[1])
                         n_ph = n_ph[mask]
                         Qi = Qi[mask]
@@ -2215,3 +2239,174 @@ class ResonatorPowerSweep:
         ]
         len_after_trim = len(self.fit_data['Qi_dia_corr'])
         print(f"Trimmed {len_before_trim - len_after_trim} data points for qi range {qi_lims}.")
+
+class ResonatorTempSweep:
+    
+    def __init__(self):
+        pass
+
+    # TLS fit - temperature dependence of Qi
+    @static_method
+    def TLS_fit_crowley_temp(
+        Qi, T, n_ph, f, bounds=None, Qerr=None, print_log=False, print_fit=True, T_lims=None
+    ):
+        """
+        Function for fitting TLS loss model (from Crowley et al. http://arxiv.org/abs/2301.07848) to T vs. Qi. Fits parameters [t_c, Q_TLS0, Q_QP0, Q_other, D, beta1, beta2].
+
+        Inputs:
+        - n_ph      Integer for power value
+        - T         Array of Temperatures (in K)
+        - Qi        Array of Qi values
+
+        Outputs:
+        - Tuple containing (x, y, z)
+            - x: dict of fit parameters {t_c, Q_TLS0, Q_QP0, Q_other, D, beta1, beta2}
+            - y: n_ph (array)
+            - z: the TLS fit as a function of n_ph (array)
+        """
+
+        assert isinstance(n_ph, (float, int)), "Photon number should be a float or int."
+        assert isinstance(f, (float, int)), "Frequency should be a float or int in Hz."
+        assert len([T, Qi]) > 0, "Please provide n_ph and Qi data."
+        assert all(T[i] <= T[i + 1] for i in range(len(T) - 1)), "Data is not sorted by temperature."
+        assert len(T) == len(Qi), "T and Qi must be the same length."
+        if Qerr is not None:
+            assert len(T) == len(Qerr), "T and Qerr must be the same length."
+        
+        if f < 100:
+            print(f"We are assuming you entered frequency in GHz... converting to Hz.")
+            f = f * 1e9  # convert GHz to Hz
+
+        if T_lims is not None:
+            # slice lists to photon number limits
+            lower_index = next((i for i, val in enumerate(T) if val > T_lims[0]), -1)
+            upper_index = next((i for i, val in enumerate(T) if val < T_lims[1]), -1)
+            # slice data
+            T = T[lower_index:upper_index]
+            Qi = Qi[lower_index:upper_index]
+            if Qerr is not None:
+                Qerr = Qerr[lower_index:upper_index]
+
+        # constants
+        hbar = 6.582 * 10 ** (-16) # eV
+        kB = 8.617 * 10 ** (-5)    # eV
+        omega = 2 * np.pi * f
+
+        # safety
+        T = np.clip(T, 1e-12, None)
+
+        def TLS_model_T_crowley(T, t_c, Q_TLS0, Q_QP0, Q_other, D, beta1, beta2):
+            delta_0 = 1.764 * kB * t_c  # superconducting gap
+
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                omega_term = (hbar * omega) / (2 * kB * T)
+                tanh = np.tanh(omega_term)
+                sinh = np.sinh(omega_term)
+                k0 = kn(0, omega_term)
+
+                # Clip sinh and k0 to prevent divide-by-zero
+                sinh = np.clip(sinh, 1e-12, None)
+                k0 = np.clip(k0, 1e-12, None)
+
+                # Clip the exponent before applying np.exp to avoid overflow
+                exponent = delta_0 / (kB * T)
+                exponent = np.clip(exponent, None, 700)
+                numerator_QP = np.exp(exponent)
+
+                # Compute and clip Q_QP intermediate result
+                Q_QP_raw = numerator_QP / (sinh * k0)
+                Q_QP_raw = np.clip(Q_QP_raw, None, 1e300)
+                Q_QP = Q_QP0 * Q_QP_raw
+                Q_QP = np.nan_to_num(Q_QP, nan=0.0, posinf=1e300)
+
+                # TLS part
+                numerator_TLS = np.sqrt(1 + ((n_ph**beta2) / (D * T**beta1)) * tanh)
+                tanh = np.clip(tanh, 1e-12, None)
+                Q_TLS = Q_TLS0 * (numerator_TLS / tanh)
+                Q_TLS = np.nan_to_num(Q_TLS, nan=0.0, posinf=1e300)
+
+                # Final total Qi
+                Q_other_safe = np.clip(Q_other, 1e-12, None)
+                Q_i = 1 / (1 / Q_TLS + 1 / Q_QP + 1 / Q_other_safe)
+                Q_i = np.nan_to_num(Q_i, nan=0.0, posinf=1e300)
+
+            return Q_i
+
+        # initial guesses: t_c, Q_TLS0, Q_QP0, Q_other, D, beta1, beta2
+        init_guesses = [4.4, 1.0e6, 1.0e6, 1.0e7, 1.0, 0.5, 0.5]
+
+        # default bounds: t_c, Q_TLS0, Q_QP0, Q_other, D, beta1, beta2
+        if bounds == None:
+            bounds = ([4.0, 1.0e3, 1.0e1, 1.0e3, 1.0e-8, 1.0e-8, 1.0e-8], 
+                    [5.0, 1.0e8, 1.0e8, 1.0e8, 1.0e6, 1.0, 1.0])
+        else:
+            assert isinstance(
+                bounds, tuple
+            ), "Bounds should be passed as a tuple of lists, with elements corresponding to [F_delta_TLS0, n_c, Q_HP, beta]. The first tuple entry is lower bounds, and the second is upper. e.g. bounds = ([0, 0.2, 0, 0.0], [1, 1e3, 1e9, 1])"
+            assert (
+                len(bounds[0]) == 7 and len(bounds[1]) == 7
+            ), "Bounds should be passed as a tuple of lists, with elements corresponding to [F_delta_TLS0, n_c, Q_HP, beta]. The first tuple entry is lower bounds, and the second is upper. e.g. bounds = ([0, 0.2, 0, 0.0], [1, 1e3, 1e9, 1])"
+
+        # check guesses are valid (if not, move within bounds)
+        for i, init in enumerate(init_guesses):
+            if init < bounds[0][i]:
+                init_guesses[i] = bounds[0][i] + 1e-8
+            elif init > bounds[1][i]:
+                init_guesses[i] = bounds[1][i] - 1e-8
+
+        # with error bars
+        if Qerr:
+            try:
+                popt, pcov, infodict, mesg, ier = curve_fit(
+                    TLS_model_T_crowley,
+                    xdata=np.array(T),
+                    ydata=np.array(Qi),
+                    p0=init_guesses,
+                    sigma=np.array(Qerr),
+                    bounds=bounds,
+                    full_output=True,
+                )
+            except:
+                popt = [0, 0, 0, 0, 0, 0, 0]
+        # without error bars
+        else:
+            try:
+                popt, pcov, infodict, mesg, ier = curve_fit(
+                    TLS_model_T_crowley,
+                    xdata=np.array(T),
+                    ydata=np.array(Qi),
+                    p0=init_guesses,
+                    bounds=bounds,
+                    full_output=True,
+                )
+            except:
+                popt = [0, 0, 0, 0, 0, 0, 0]
+
+        if print_fit == True:
+            print(f"TLS fit ({f*1e-9:.2f} GHz)") if print_log != True else 0
+            print(f" t_c =     {popt[0]:.4f}")
+            print(f" Q_TLS0 =  {popt[1]:.4e}")
+            print(f" Q_QP0 =   {popt[2]:.4e}")
+            print(f" Q_other = {popt[3]:.4e}")
+            print(f" D =       {popt[4]:.4f}")
+            print(f" beta1 =   {popt[5]:.4f}")
+            print(f" beta2 =   {popt[6]:.4f}\n")
+        
+        # t_c, Q_TLS0, Q_QP0, Q_other, D, beta1, beta2
+        fit_dict = {
+            "t_c": popt[0],
+            "Q_TLS0": popt[1],
+            "Q_QP0": popt[2],
+            "Q_other": popt[3],
+            "D": popt[4],
+            "beta1": popt[5],
+            "beta2": popt[6]
+        }
+
+        # make smooth T array for plotting
+        T_min = np.min(T)
+        T_max = np.max(T)
+        T_smooth = np.linspace(T_min, T_max, 1000)
+
+        # return (x, y) tuple of fit data
+        return (fit_dict, T_smooth, TLS_model_T_crowley(np.array(T_smooth), *popt))
